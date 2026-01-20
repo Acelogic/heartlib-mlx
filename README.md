@@ -114,6 +114,7 @@ codec = HeartCodec.from_pretrained("./ckpt-mlx/heartcodec")
 | `--temperature` | 1.0 | Sampling temperature (lower = more deterministic) |
 | `--topk` | 50 | Top-k sampling |
 | `--output` | output.wav | Output file path |
+| `--dtype` | float32 | Model dtype (use `bfloat16` for ~50% less memory) |
 
 ## Performance
 
@@ -216,11 +217,12 @@ huggingface-cli download HeartMuLa/HeartMuLa-oss-3B tokenizer.json --local-dir c
 python -m heartlib_mlx.utils.convert --src ./ckpt --dst ./ckpt-mlx
 ```
 
-### "Out of memory"
+### "Out of memory" or high memory usage
 
-- Use a Mac with 32GB+ unified memory
+- Use `--dtype bfloat16` to halve memory usage
 - Reduce `--duration` for shorter generations
 - Close other applications to free memory
+- Use a Mac with 32GB+ unified memory for long generations
 
 ### Generation sounds wrong
 

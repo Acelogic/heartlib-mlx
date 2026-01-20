@@ -102,6 +102,13 @@ Examples:
         default=48000,
         help="Output sample rate (default: 48000)",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "bfloat16", "float16"],
+        help="Model dtype (default: float32, use bfloat16 for less memory)",
+    )
     args = parser.parse_args()
 
     # Find checkpoint
@@ -143,6 +150,16 @@ Examples:
     print("Loading models...")
     model = HeartMuLa.from_pretrained(f"{ckpt_path}/heartmula")
     codec = HeartCodec.from_pretrained(f"{ckpt_path}/heartcodec")
+
+    # Convert to specified dtype for memory efficiency
+    if args.dtype == "bfloat16":
+        print("Converting model to bfloat16...")
+        model.set_dtype(mx.bfloat16)
+        codec.set_dtype(mx.bfloat16)
+    elif args.dtype == "float16":
+        print("Converting model to float16...")
+        model.set_dtype(mx.float16)
+        codec.set_dtype(mx.float16)
 
     # Load tokenizer
     tokenizer_path = Path(ckpt_path).parent / "ckpt" / "tokenizer.json"
@@ -241,6 +258,10 @@ Examples:
             cfg_scale=args.cfg_scale,
         )
         mx.eval(curr_token)
+
+        # Periodically clear MLX cache to prevent memory buildup
+        if i % 50 == 0 and i > 0:
+            mx.clear_cache()
 
         if mx.any(curr_token[0] >= audio_eos_id):
             break
