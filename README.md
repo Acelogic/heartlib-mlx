@@ -1,8 +1,26 @@
 # HeartLib MLX
 
-Apple MLX port of [HeartMuLa](https://github.com/HeartMuLa/heartlib) - a family of open-source music foundation models.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+[![MLX](https://img.shields.io/badge/MLX-Apple%20Silicon-orange.svg)](https://github.com/ml-explore/mlx)
+[![HuggingFace](https://img.shields.io/badge/🤗-Models-yellow.svg)](https://huggingface.co/HeartMuLa)
+
+Apple MLX port of [HeartMuLa](https://github.com/HeartMuLa/heartlib) — open-source music foundation models achieving **comparable quality to Suno**.
 
 **2x faster** than PyTorch MPS on Apple Silicon with optimized memory usage.
+
+🎵 **Multilingual**: English, Chinese, Japanese, Korean, Spanish
+
+![HeartLib MLX](docs/screenshots/hero.png)
+
+## Features
+
+- **Fast Generation** - 2x faster than PyTorch MPS on Apple Silicon
+- **Suno-Quality Output** - 3B model with high musicality and fidelity
+- **Web UI** - Modern dark-themed interface for music creation
+- **AI Album Art** - Automatic cover art generation with Flux (via MFLUX)
+- **Library Management** - Browse, search, and play all your generations
+- **Real-time Progress** - Live updates during generation with cancel support
 
 ## Quick Start (with uv)
 
@@ -73,6 +91,28 @@ python -m heartlib_mlx.utils.convert --src ./ckpt --dst ./ckpt-mlx
 ```
 
 ## Usage
+
+### Web UI
+
+The easiest way to generate music is through the web interface:
+
+```bash
+# Launch the web UI
+uv run server.py
+
+# Open http://localhost:8080 in your browser
+```
+
+![Create View](docs/screenshots/create.png)
+
+**Features:**
+- **Create** - Write lyrics, select style tags, adjust parameters
+- **Library** - Browse all generated songs with album art
+- **Player** - Full-featured audio player with progress, shuffle, repeat
+- **AI Album Art** - Automatically generates cover art for each song
+- **Cancel** - Stop generation mid-progress if needed
+
+![Player Bar](docs/screenshots/player.png)
 
 ### Command Line
 
@@ -177,7 +217,8 @@ Neural audio codec operating at 12.5Hz:
 
 ```
 heartlib-mlx/
-├── generate.py              # Easy generation script (uv compatible)
+├── app.py                   # Gradio web UI
+├── generate.py              # CLI generation script (uv compatible)
 ├── src/heartlib_mlx/
 │   ├── heartcodec/          # Neural audio codec
 │   ├── heartmula/           # Music language model
@@ -241,6 +282,10 @@ python -m heartlib_mlx.utils.convert --src ./ckpt --dst ./ckpt-mlx
 - Ensure weights are correctly converted (run `trace_backbone.py` to verify)
 - Try different `--cfg-scale` values (1.0-3.0)
 - Adjust `--temperature` (lower = more coherent, higher = more creative)
+
+## Community
+
+Join the [HeartMuLa Discord](https://discord.gg/FmHPvny9sP) for support, discussions, and sharing your creations.
 
 ## License
 
