@@ -124,6 +124,8 @@ class LlamaAttention(nn.Module):
             k_cache, v_cache = cache
             k = mx.concatenate([k_cache, k], axis=1)
             v = mx.concatenate([v_cache, v], axis=1)
+            # Evaluate to materialize and prevent computation graph accumulation
+            mx.eval(k, v)
 
         # Repeat K, V for grouped-query attention
         if self.n_rep > 1:
