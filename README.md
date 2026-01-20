@@ -115,6 +115,8 @@ codec = HeartCodec.from_pretrained("./ckpt-mlx/heartcodec")
 | `--topk` | 50 | Top-k sampling |
 | `--output` | output.wav | Output file path |
 | `--dtype` | float32 | Model dtype (use `bfloat16` for ~50% less memory) |
+| `--max-memory` | 32 | Memory limit in GB (generation stops if exceeded) |
+| `--ignore-eos` | false | Force full duration (ignore model's end-of-song token) |
 
 ## Performance
 
@@ -140,11 +142,19 @@ Benchmarks on Apple M2 Max (32GB unified memory):
 
 ### Memory Usage
 
-| Model | Memory |
-|-------|--------|
-| HeartMuLa-3B | ~8GB |
+| Component | Memory (bfloat16) |
+|-----------|-------------------|
+| HeartMuLa-3B | ~6GB |
 | HeartCodec | ~2GB |
-| Total | ~10GB |
+| KV Cache (1 min) | ~1GB |
+| KV Cache (5 min) | ~5GB |
+| **Total (1 min song)** | **~11GB** |
+| **Total (5 min song)** | **~15GB** |
+
+Memory is monitored during generation with Metal GPU stats:
+```
+[Frame 500/3750] Metal: 11.1GB | VMS: 406GB | RSS: 10.6GB | 3.6 f/s | ETA: 5.9min
+```
 
 ## Architecture
 
@@ -219,10 +229,12 @@ python -m heartlib_mlx.utils.convert --src ./ckpt --dst ./ckpt-mlx
 
 ### "Out of memory" or high memory usage
 
-- Use `--dtype bfloat16` to halve memory usage
+- Use `--dtype bfloat16` to halve memory usage (recommended)
+- Set `--max-memory 20` to limit memory on smaller Macs
 - Reduce `--duration` for shorter generations
-- Close other applications to free memory
-- Use a Mac with 32GB+ unified memory for long generations
+- KV cache grows ~1GB per minute of audio
+- **24GB Mac**: Up to ~3-4 minutes with bfloat16
+- **32GB+ Mac**: 5+ minutes comfortably
 
 ### Generation sounds wrong
 
