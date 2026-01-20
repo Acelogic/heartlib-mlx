@@ -70,3 +70,4 @@ logs/
 *.bak
 ckpt-pytorch/
 docs/*.pdf
+outputs/
