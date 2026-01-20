@@ -1,5 +1,6 @@
 """HeartMuLa - Music Language Model."""
 
+from functools import partial
 from typing import Optional, Tuple, List, Union
 from pathlib import Path
 
@@ -11,37 +12,25 @@ from heartlib_mlx.heartmula.backbone import HeartMuLaBackbone
 from heartlib_mlx.heartmula.decoder import HeartMuLaDecoder
 
 
-def sample_topk(logits: mx.array, topk: int, temperature: float) -> mx.array:
-    """Sample from logits using top-k sampling.
-
-    Args:
-        logits: Logits of shape (batch, vocab_size).
-        topk: Number of top tokens to consider.
-        temperature: Sampling temperature.
-
-    Returns:
-        Sampled token IDs of shape (batch, 1).
-    """
+# Compiled top-k sampling for faster inference
+@mx.compile
+def _sample_topk_compiled(logits: mx.array, topk: int, temperature: float) -> mx.array:
+    """Compiled top-k sampling."""
     logits = logits / temperature
-
-    # Get top-k
     topk = min(topk, logits.shape[-1])
-
-    # Get top-k values and indices
-    # argsort in descending order
     sorted_indices = mx.argsort(-logits, axis=-1)
     topk_indices = sorted_indices[:, :topk]
     topk_logits = mx.take_along_axis(logits, topk_indices, axis=-1)
-
-    # Mask out non-top-k
     mask = mx.full(logits.shape, float("-inf"))
     mask = mx.put_along_axis(mask, topk_indices, topk_logits, axis=-1)
-
-    # Log softmax and sample
     log_probs = mx.log(mx.softmax(mask, axis=-1) + 1e-10)
     samples = mx.random.categorical(log_probs)
-
     return samples[:, None]
+
+
+def sample_topk(logits: mx.array, topk: int, temperature: float) -> mx.array:
+    """Sample from logits using top-k sampling (uses compiled version)."""
+    return _sample_topk_compiled(logits, topk, temperature)
 
 
 class HeartMuLa(nn.Module):
