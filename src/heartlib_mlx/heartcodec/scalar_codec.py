@@ -5,7 +5,7 @@ from typing import List, Tuple, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from heartlib_mlx.nn.conv import CausalConv1d, WeightNormConv1d, WeightNormConvTranspose1d
+from heartlib_mlx.nn.conv import CausalConv1d, Conv1d, WeightNormConv1d, WeightNormConvTranspose1d
 from heartlib_mlx.heartcodec.activations import Snake, PReLU
 from heartlib_mlx.heartcodec.quantizer import ScalarQuantizer
 
@@ -168,12 +168,14 @@ class ResDecoderBlock(nn.Module):
 
         # Upsampling convolution (transposed)
         # Note: PyTorch uses activation=None here
+        # For causal mode: padding=0 and output is trimmed by stride samples
         self.upsample = WeightNormConvTranspose1d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=stride * 2,
             stride=stride,
-            padding=stride // 2,
+            padding=0 if causal else stride // 2,
+            causal=causal,
         )
 
         # No activation after upsample (matches PyTorch)
@@ -232,6 +234,7 @@ class ScalarModel(nn.Module):
         num_bands: int = 1,
         sample_rate: int = 48000,
         causal: bool = True,
+        num_samples: int = 2,
         downsample_factors: Optional[List[int]] = None,
         downsample_kernel_sizes: Optional[List[int]] = None,
         upsample_factors: Optional[List[int]] = None,
@@ -243,6 +246,7 @@ class ScalarModel(nn.Module):
         res_kernel_size: int = 7,
     ):
         super().__init__()
+        self.num_samples = num_samples
 
         downsample_factors = downsample_factors or [4, 4, 8, 8]
         downsample_kernel_sizes = downsample_kernel_sizes or [8, 8, 16, 16]
@@ -293,11 +297,13 @@ class ScalarModel(nn.Module):
 
         # ========== Decoder ==========
         # Initial decoder conv from latent (uses delay_kernel_size per PyTorch)
+        # Non-causal with symmetric padding to preserve length
         self.decoder_in = WeightNormConv1d(
             in_channels=latent_hidden_dim,
             out_channels=channels[-1],
             kernel_size=delay_kernel_size,
-            causal=False,  # Note: PyTorch decoder uses non-causal here
+            padding=(delay_kernel_size - 1) // 2,  # Symmetric padding for non-causal
+            causal=False,
         )
 
         # Decoder blocks (reverse order)
@@ -313,6 +319,22 @@ class ScalarModel(nn.Module):
                     stride=stride,
                     causal=causal,
                 )
+            )
+
+        # PostProcessor conv (decoder.6.conv in PyTorch)
+        # This uses causal padding when causal=True
+        if causal:
+            self.post_conv = CausalConv1d(
+                in_channels=init_channel,
+                out_channels=init_channel,
+                kernel_size=default_kernel_size,
+            )
+        else:
+            self.post_conv = Conv1d(
+                in_channels=init_channel,
+                out_channels=init_channel,
+                kernel_size=default_kernel_size,
+                padding=(default_kernel_size - 1) // 2,  # Same padding for non-causal
             )
 
         # Final decoder conv
@@ -364,9 +386,25 @@ class ScalarModel(nn.Module):
         x = self.decoder_in(z)
         for block in self.decoder_blocks:
             x = block(x)
+
+        # PostProcessor (decoder.6 in PyTorch):
+        # 1. Repeat each sample num_samples times (sample-level upsampling)
+        # 2. Apply conv
+        # 3. Apply activation
+        if self.num_samples > 1:
+            # x shape: (batch, time, channels)
+            batch, time, channels = x.shape
+            # Repeat each time step num_samples times
+            # (batch, time, channels) -> (batch, time, num_samples, channels) -> (batch, time*num_samples, channels)
+            x = mx.repeat(x[:, :, None, :], self.num_samples, axis=2)
+            x = x.reshape(batch, time * self.num_samples, channels)
+
+        x = self.post_conv(x)
         x = self.activation(x)
+
+        # Final output conv (decoder.7 in PyTorch)
         x = self.decoder_out(x)
-        x = self.tanh(x)
+        # Note: No tanh at the end - tanh is only used in encoding
 
         return x
 

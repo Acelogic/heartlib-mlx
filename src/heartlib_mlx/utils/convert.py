@@ -285,9 +285,10 @@ def convert_heartcodec_weights(weights: Dict[str, np.ndarray]) -> Dict[str, np.n
                 weight_full = g_original * v_original / v_norm  # (in, out, k)
                 # Convert to MLX layout: (out, k, in)
                 weight_mlx = weight_full.transpose(1, 2, 0)
-                # For MLX, set g=1 and v=full weight (already normalized and scaled)
-                v_converted = weight_mlx
-                g_converted = np.ones(weight_mlx.shape[0])
+                # Store the pre-computed weight directly (no weight_g/weight_v)
+                new_key = _map_heartcodec_key(base_key)
+                converted[f"{new_key}.weight"] = weight_mlx
+                continue  # Skip the weight_g/weight_v assignment below
             else:
                 # Regular Conv1d: PyTorch (out, in, k) -> MLX (out, k, in)
                 g_converted = g.squeeze()
@@ -398,10 +399,13 @@ def _map_heartcodec_key(key: str) -> str:
     new_key = new_key.replace('scalar_model.decoder.7.', 'scalar_model.decoder_out.')
     new_key = new_key.replace('scalar_model.decoder.7', 'scalar_model.decoder_out')
 
-    # Map PostProcessor activation (decoder.6.activation) -> scalar_model.activation
-    # (The PostProcessor conv is skipped, but we need its activation)
+    # Map PostProcessor (decoder.6)
+    # activation -> scalar_model.activation
+    # conv -> scalar_model.post_conv
     new_key = new_key.replace('scalar_model.decoder.6.activation.', 'scalar_model.activation.')
     new_key = new_key.replace('scalar_model.decoder.6.activation', 'scalar_model.activation')
+    new_key = new_key.replace('scalar_model.decoder.6.conv.', 'scalar_model.post_conv.')
+    new_key = new_key.replace('scalar_model.decoder.6.conv', 'scalar_model.post_conv')
 
     # Map residual unit structure
     new_key = new_key.replace('.convs.', '.residual_units.')
@@ -443,12 +447,12 @@ def convert_heartmula_weights(weights: Dict[str, np.ndarray]) -> Dict[str, np.nd
     """Convert HeartMuLa weights from PyTorch to MLX format.
 
     Handles:
-    1. Audio embeddings: (65576, 3072) split into 8 codebook embeddings
-    2. Audio head: (7, 3072, 8197) reshape to (57379, 3072)
+    1. Audio embeddings: keep as single (65576, 3072) table
+    2. Audio head: (7, 3072, 8197) reshape to (57379, 3072) for nn.Linear
     3. Attention naming: output_proj -> o_proj
     4. MLP naming: w1/w2/w3 -> gate_proj/up_proj/down_proj
     5. Norm naming: sa_norm/mlp_norm with .scale -> attention_norm/mlp_norm with .weight
-    6. Unconditional embedding squeeze: (1, 3072) -> (3072,)
+    6. Unconditional embedding: keep as nn.Embedding weight
 
     Args:
         weights: PyTorch weights.
@@ -458,28 +462,19 @@ def convert_heartmula_weights(weights: Dict[str, np.ndarray]) -> Dict[str, np.nd
     """
     converted = {}
 
-    # Constants from config
-    AUDIO_VOCAB_SIZE = 8197
-    NUM_CODEBOOKS = 8
-
     for key, value in weights.items():
         # === Special handling for specific keys ===
 
-        # 1. Split audio_embeddings into 8 codebook embeddings
+        # 1. Keep audio_embeddings as single table (matches new model structure)
         if key == "audio_embeddings.weight":
-            # Shape: (65576, 3072) = (8 * 8197, 3072)
-            for i in range(NUM_CODEBOOKS):
-                start = i * AUDIO_VOCAB_SIZE
-                end = (i + 1) * AUDIO_VOCAB_SIZE
-                codebook_weight = value[start:end, :]
-                new_key = f"embeddings.audio_embedding.embeddings.{i}.weight"
-                converted[new_key] = codebook_weight
+            # Shape: (65576, 3072) = (8 * 8197, 3072) - keep as is
+            converted["audio_embeddings.weight"] = value
             continue
 
         # 2. Convert audio_head from (7, 3072, 8197) to (57379, 3072)
         if key == "audio_head":
             # PyTorch: (num_codebooks-1, dim, vocab_size) = (7, 3072, 8197)
-            # MLX: (vocab_size * (num_codebooks-1), dim) = (57379, 3072)
+            # MLX nn.Linear: (out_features, in_features) = (57379, 3072)
             # First transpose each codebook's weights, then concatenate
             # (7, 3072, 8197) -> (7, 8197, 3072) -> (57379, 3072)
             transposed = value.transpose(0, 2, 1)  # (7, 8197, 3072)
@@ -487,10 +482,10 @@ def convert_heartmula_weights(weights: Dict[str, np.ndarray]) -> Dict[str, np.nd
             converted["audio_head.weight"] = flattened
             continue
 
-        # 3. Squeeze unconditional_text_embedding
+        # 3. Keep unconditional_text_embedding as nn.Embedding weight
         if key == "unconditional_text_embedding.weight":
-            # Shape: (1, 3072) -> (3072,)
-            converted["embeddings.unconditional_embedding"] = value.squeeze(0)
+            # Shape: (1, 3072) - keep as embedding weight
+            converted["unconditional_text_embedding.weight"] = value
             continue
 
         # === General key mapping ===
@@ -519,7 +514,7 @@ def _map_heartmula_key(key: str) -> str:
     new_key = key
 
     # === Embedding mappings ===
-    new_key = new_key.replace("text_embeddings.weight", "embeddings.text_embedding.embedding.weight")
+    # text_embeddings stays the same (both PyTorch and MLX use text_embeddings)
 
     # === Attention mappings ===
     # output_proj -> o_proj

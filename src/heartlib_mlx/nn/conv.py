@@ -197,6 +197,18 @@ class WeightNormConv1d(nn.Module):
 class WeightNormConvTranspose1d(nn.Module):
     """1D Transposed Convolution with weight normalization.
 
+    This layer supports two modes:
+    1. Standard weight normalization: weight = g * v / ||v||
+    2. Pre-computed weights: weight is stored directly (for converted PyTorch weights)
+
+    The pre-computed mode is used when loading weights from PyTorch, where the
+    weight normalization has already been applied and we just need to store
+    the final weight matrix.
+
+    For causal mode (matching PyTorch HeartCodec):
+    - Uses padding=0
+    - Trims output by stride samples from the end
+
     Args:
         in_channels: Number of input channels.
         out_channels: Number of output channels.
@@ -207,6 +219,7 @@ class WeightNormConvTranspose1d(nn.Module):
         dilation: Dilation factor.
         groups: Number of groups for grouped convolution.
         bias: Whether to include a bias term.
+        causal: Whether to use causal mode (trims stride samples from end).
     """
 
     def __init__(
@@ -220,6 +233,7 @@ class WeightNormConvTranspose1d(nn.Module):
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
+        causal: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -230,32 +244,25 @@ class WeightNormConvTranspose1d(nn.Module):
         self.output_padding = output_padding
         self.dilation = dilation
         self.groups = groups
+        self.causal = causal
 
-        # Weight normalization parameters
-        # For conv_transpose: we use weight shape (out_channels, kernel_size, in_channels // groups)
-        # because we'll transpose it for the backwards conv operation
+        # Weight storage - we store the pre-computed weight directly
+        # Shape: (out_channels, kernel_size, in_channels // groups)
         scale = 1.0 / (in_channels * kernel_size) ** 0.5
-        self.weight_v = mx.random.uniform(
+        self.weight = mx.random.uniform(
             low=-scale,
             high=scale,
             shape=(out_channels, kernel_size, in_channels // groups),
         )
-
-        # g is the magnitude (per output channel)
-        v_norm = mx.sqrt(mx.sum(self.weight_v ** 2, axis=(1, 2), keepdims=True))
-        self.weight_g = v_norm.squeeze((1, 2))
 
         if bias:
             self.bias = mx.zeros((out_channels,))
         else:
             self.bias = None
 
-    def _get_normalized_weight(self) -> mx.array:
-        """Compute the weight-normalized weight tensor."""
-        v_norm = mx.sqrt(mx.sum(self.weight_v ** 2, axis=(1, 2), keepdims=True) + 1e-8)
-        v_normalized = self.weight_v / v_norm
-        weight = self.weight_g[:, None, None] * v_normalized
-        return weight
+    def _get_weight(self) -> mx.array:
+        """Get the weight tensor."""
+        return self.weight
 
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass.
@@ -267,7 +274,7 @@ class WeightNormConvTranspose1d(nn.Module):
             Output tensor of shape (batch, output_length, out_channels).
         """
         batch_size, seq_len, channels = x.shape
-        weight = self._get_normalized_weight()
+        weight = self._get_weight()
 
         # Compute output length
         output_len = (seq_len - 1) * self.stride - 2 * self.padding + self.kernel_size + self.output_padding
@@ -319,6 +326,10 @@ class WeightNormConvTranspose1d(nn.Module):
         elif y.shape[1] < output_len:
             pad_size = output_len - y.shape[1]
             y = mx.pad(y, [(0, 0), (0, pad_size), (0, 0)])
+
+        # Causal mode: trim stride samples from end (matches PyTorch HeartCodec)
+        if self.causal and self.stride > 0:
+            y = y[:, :-self.stride, :]
 
         if self.bias is not None:
             y = y + self.bias

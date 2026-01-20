@@ -140,8 +140,19 @@ class HeartCodecConfig:
 
     @property
     def frame_rate(self) -> float:
-        """Frame rate of the codec in Hz."""
-        return self.sample_rate / self.total_stride
+        """Frame rate of the codec codes in Hz.
+
+        HeartCodec operates at 12.5 Hz code rate:
+        - Codes: 12.5 Hz
+        - Flow matching latent: 25 Hz (2x codes)
+        - Scalar model stride: 960
+        - Scalar model num_samples: 2
+        - Audio: 48000 Hz
+
+        The formula is: sample_rate / (total_stride * num_samples * 2)
+        where the extra *2 accounts for the flow matching 2x upsampling.
+        """
+        return self.sample_rate / (self.total_stride * self.num_samples * 2)
 
     @property
     def transformer_dim(self) -> int:

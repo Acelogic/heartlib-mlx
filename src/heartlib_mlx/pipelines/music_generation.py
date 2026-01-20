@@ -1,11 +1,12 @@
 """Music generation pipeline for HeartMuLa."""
 
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Dict, Any
 from pathlib import Path
 from dataclasses import dataclass
 import json
 
 import mlx.core as mx
+import numpy as np
 
 from heartlib_mlx.heartcodec import HeartCodec, HeartCodecConfig
 from heartlib_mlx.heartmula import HeartMuLa, HeartMuLaConfig
@@ -13,23 +14,12 @@ from heartlib_mlx.heartmula import HeartMuLa, HeartMuLaConfig
 
 @dataclass
 class HeartMuLaGenConfig:
-    """Configuration for music generation pipeline.
-
-    Attributes:
-        text_bos_id: Beginning of text token ID.
-        text_eos_id: End of text token ID.
-        audio_bos_id: Beginning of audio token ID.
-        audio_eos_id: End of audio token ID.
-        audio_empty_id: Empty audio token ID.
-        sample_rate: Audio sample rate.
-        frame_rate: Codec frame rate.
-    """
+    """Configuration for music generation pipeline."""
 
     text_bos_id: int = 128000
     text_eos_id: int = 128001
-    audio_bos_id: int = 8193
-    audio_eos_id: int = 8194
-    audio_empty_id: int = 8195
+    audio_eos_id: int = 8193
+    empty_id: int = 0
     sample_rate: int = 48000
     frame_rate: float = 12.5
 
@@ -47,19 +37,10 @@ class HeartMuLaGenConfig:
 class HeartMuLaGenPipeline:
     """Music generation pipeline using HeartMuLa and HeartCodec.
 
-    This pipeline handles:
-    1. Text preprocessing (tags and lyrics)
-    2. Autoregressive audio generation
+    Matches the PyTorch implementation flow exactly:
+    1. Text preprocessing (tags and lyrics) into combined token format
+    2. Autoregressive audio generation with CFG
     3. Audio reconstruction via HeartCodec
-
-    Example:
-        >>> pipeline = HeartMuLaGenPipeline.from_pretrained("./ckpt-mlx")
-        >>> audio = pipeline(
-        ...     lyrics="[Verse]\\nHello world...",
-        ...     tags="pop, acoustic, female vocal",
-        ...     duration=30.0,
-        ... )
-        >>> pipeline.save_audio(audio, "output.mp3")
     """
 
     def __init__(
@@ -69,18 +50,11 @@ class HeartMuLaGenPipeline:
         tokenizer,
         config: HeartMuLaGenConfig,
     ):
-        """Initialize the pipeline.
-
-        Args:
-            heartmula: HeartMuLa model.
-            heartcodec: HeartCodec model.
-            tokenizer: Text tokenizer.
-            config: Generation configuration.
-        """
         self.heartmula = heartmula
         self.heartcodec = heartcodec
         self.tokenizer = tokenizer
         self.config = config
+        self._parallel_number = heartmula.num_codebooks + 1  # 8 codebooks + 1 text
 
     @classmethod
     def from_pretrained(
@@ -88,15 +62,7 @@ class HeartMuLaGenPipeline:
         path: Union[str, Path],
         dtype: mx.Dtype = mx.bfloat16,
     ) -> "HeartMuLaGenPipeline":
-        """Load pipeline from pretrained weights.
-
-        Args:
-            path: Path to the model directory.
-            dtype: Data type for model weights.
-
-        Returns:
-            HeartMuLaGenPipeline instance.
-        """
+        """Load pipeline from pretrained weights."""
         from tokenizers import Tokenizer
 
         path = Path(path)
@@ -104,7 +70,7 @@ class HeartMuLaGenPipeline:
         # Load HeartMuLa
         heartmula_path = path / "heartmula"
         if not heartmula_path.exists():
-            heartmula_path = path  # Try root path
+            heartmula_path = path
         heartmula = HeartMuLa.from_pretrained(heartmula_path, dtype=dtype)
 
         # Load HeartCodec
@@ -129,109 +95,214 @@ class HeartMuLaGenPipeline:
         self,
         lyrics: Optional[str] = None,
         tags: Optional[str] = None,
-        use_cfg: bool = True,
-    ) -> mx.array:
-        """Preprocess text inputs.
+        cfg_scale: float = 1.5,
+    ) -> Dict[str, mx.array]:
+        """Preprocess text inputs into combined token format.
 
         Args:
             lyrics: Lyrics text.
             tags: Comma-separated tags.
-            use_cfg: Whether to prepare for classifier-free guidance.
+            cfg_scale: CFG scale (determines batch size).
 
         Returns:
-            Token IDs.
+            Dictionary with tokens, tokens_mask, muq_embed, muq_idx, pos.
         """
-        # Normalize tags
+        # Process tags
         if tags:
             tags = tags.lower().strip()
-            tags = f"<tag>{tags}</tag>"
+            if not tags.startswith("<tag>"):
+                tags = f"<tag>{tags}"
+            if not tags.endswith("</tag>"):
+                tags = f"{tags}</tag>"
 
-        # Normalize lyrics
-        if lyrics:
-            lyrics = lyrics.strip()
-
-        # Combine
-        text = ""
-        if tags:
-            text += tags + " "
-        if lyrics:
-            text += lyrics
-
-        # Tokenize
-        if self.tokenizer is not None:
-            encoding = self.tokenizer.encode(text)
-            token_ids = mx.array([encoding.ids])
+        # Tokenize tags
+        if self.tokenizer is not None and tags:
+            tags_ids = self.tokenizer.encode(tags).ids
         else:
-            # Fallback: simple character encoding
-            token_ids = mx.array([[ord(c) for c in text]])
+            tags_ids = []
 
-        # Add BOS/EOS
-        bos = mx.array([[self.config.text_bos_id]])
-        eos = mx.array([[self.config.text_eos_id]])
-        token_ids = mx.concatenate([bos, token_ids, eos], axis=1)
+        # Add BOS/EOS to tags
+        if tags_ids and tags_ids[0] != self.config.text_bos_id:
+            tags_ids = [self.config.text_bos_id] + tags_ids
+        if tags_ids and tags_ids[-1] != self.config.text_eos_id:
+            tags_ids = tags_ids + [self.config.text_eos_id]
 
-        return token_ids
+        # MuQ placeholder position (after tags, before lyrics)
+        muq_idx = len(tags_ids)
+
+        # Process lyrics
+        if lyrics:
+            lyrics = lyrics.lower().strip()
+
+        # Tokenize lyrics
+        if self.tokenizer is not None and lyrics:
+            lyrics_ids = self.tokenizer.encode(lyrics).ids
+        else:
+            lyrics_ids = []
+
+        # Add BOS/EOS to lyrics
+        if lyrics_ids and lyrics_ids[0] != self.config.text_bos_id:
+            lyrics_ids = [self.config.text_bos_id] + lyrics_ids
+        if lyrics_ids and lyrics_ids[-1] != self.config.text_eos_id:
+            lyrics_ids = lyrics_ids + [self.config.text_eos_id]
+
+        # Total prompt length: tags + 1 (MuQ placeholder) + lyrics
+        prompt_len = len(tags_ids) + 1 + len(lyrics_ids)
+
+        # Create combined tokens: (prompt_len, num_codebooks+1)
+        # Last column is text, first num_codebooks columns are audio (zeros for prompt)
+        tokens = np.zeros((prompt_len, self._parallel_number), dtype=np.int32)
+
+        # Fill text tokens in last column
+        if tags_ids:
+            tokens[:len(tags_ids), -1] = tags_ids
+        if lyrics_ids:
+            start_idx = len(tags_ids) + 1
+            tokens[start_idx:start_idx + len(lyrics_ids), -1] = lyrics_ids
+
+        tokens = mx.array(tokens)
+
+        # Create mask: only text column is valid for prompt
+        tokens_mask = np.zeros((prompt_len, self._parallel_number), dtype=bool)
+        tokens_mask[:, -1] = True
+        tokens_mask = mx.array(tokens_mask)
+
+        # MuQ embedding (zeros for now, no audio reference)
+        muq_embed = mx.zeros((self.heartmula.config.muq_dim,), dtype=mx.float32)
+
+        # Position indices
+        pos = mx.arange(prompt_len, dtype=mx.int32)
+
+        # Batch for CFG: duplicate if cfg_scale != 1.0
+        bs_size = 2 if cfg_scale != 1.0 else 1
+
+        def _cfg_cat(tensor: mx.array) -> mx.array:
+            tensor = tensor[None, ...]  # Add batch dim
+            if cfg_scale != 1.0:
+                tensor = mx.concatenate([tensor, tensor], axis=0)
+            return tensor
+
+        return {
+            "tokens": _cfg_cat(tokens),
+            "tokens_mask": _cfg_cat(tokens_mask),
+            "muq_embed": _cfg_cat(muq_embed),
+            "muq_idx": [muq_idx] * bs_size,
+            "pos": _cfg_cat(pos),
+        }
+
+    def _pad_audio_token(self, token: mx.array) -> tuple:
+        """Pad generated audio token for next iteration.
+
+        Args:
+            token: Audio codes of shape (batch, num_codebooks).
+
+        Returns:
+            Tuple of (padded_token, padded_token_mask).
+        """
+        batch_size = token.shape[0]
+        num_codebooks = token.shape[1]
+
+        # Create padded token: (batch, 1, num_codebooks+1)
+        # Audio codes go in first num_codebooks columns, text (empty_id) in last column
+        text_col = mx.full((batch_size, 1, 1), self.config.empty_id, dtype=mx.int32)
+        audio_cols = token[:, None, :]  # (batch, 1, num_codebooks)
+        padded_token = mx.concatenate([audio_cols, text_col], axis=2)
+
+        # Create mask: audio is valid (True), text is not (False)
+        audio_mask = mx.ones((batch_size, 1, num_codebooks), dtype=mx.bool_)
+        text_mask = mx.zeros((batch_size, 1, 1), dtype=mx.bool_)
+        padded_token_mask = mx.concatenate([audio_mask, text_mask], axis=2)
+
+        return padded_token, padded_token_mask
 
     def generate(
         self,
-        text_ids: mx.array,
+        inputs: Dict[str, Any],
         duration: float = 30.0,
         temperature: float = 1.0,
         top_k: int = 50,
         cfg_scale: float = 1.5,
     ) -> mx.array:
-        """Generate audio codes from text.
+        """Generate audio codes from preprocessed inputs.
 
         Args:
-            text_ids: Preprocessed text token IDs.
+            inputs: Preprocessed inputs from preprocess().
             duration: Target duration in seconds.
             temperature: Sampling temperature.
             top_k: Top-k sampling parameter.
             cfg_scale: Classifier-free guidance scale.
 
         Returns:
-            Generated audio codes.
+            Generated audio codes of shape (num_codebooks, num_frames).
         """
-        batch_size = text_ids.shape[0]
+        prompt_tokens = inputs["tokens"]
+        prompt_tokens_mask = inputs["tokens_mask"]
+        continuous_segment = inputs["muq_embed"]
+        starts = inputs["muq_idx"]
+        prompt_pos = inputs["pos"]
 
-        # Calculate target frames
-        target_frames = int(duration * self.config.frame_rate)
+        frames = []
 
-        # Initialize with BOS for audio
-        audio_bos = mx.full(
-            (batch_size, 1, self.heartmula.num_codebooks),
-            self.config.audio_bos_id,
-            dtype=mx.int32,
+        # Setup caches
+        bs_size = 2 if cfg_scale != 1.0 else 1
+        self.heartmula.setup_caches(bs_size)
+
+        # Generate first frame with prompt
+        curr_token = self.heartmula.generate_frame(
+            tokens=prompt_tokens,
+            tokens_mask=prompt_tokens_mask,
+            input_pos=prompt_pos,
+            temperature=temperature,
+            topk=top_k,
+            cfg_scale=cfg_scale,
+            continuous_segments=continuous_segment,
+            starts=starts,
         )
 
-        all_codes = [audio_bos]
-        backbone_cache = None
+        # Take only first batch (conditional)
+        frames.append(curr_token[0:1, :])
 
-        for frame_idx in range(target_frames):
-            # Get current audio codes
-            if len(all_codes) > 1:
-                audio_codes = mx.concatenate(all_codes, axis=1)
-            else:
-                audio_codes = all_codes[0]
+        # Calculate max frames
+        max_audio_frames = int(duration * self.config.frame_rate)
+
+        # Generate remaining frames
+        for i in range(max_audio_frames):
+            # Pad current token for next input
+            curr_token_padded, curr_token_mask = self._pad_audio_token(curr_token)
+
+            # Calculate next position
+            next_pos = prompt_pos[:, -1:] + i + 1
 
             # Generate next frame
-            new_codes, backbone_cache = self.heartmula.generate_frame(
-                text_ids=text_ids,
-                audio_codes=audio_codes,
-                backbone_cache=backbone_cache,
+            curr_token = self.heartmula.generate_frame(
+                tokens=curr_token_padded,
+                tokens_mask=curr_token_mask,
+                input_pos=next_pos,
                 temperature=temperature,
-                top_k=top_k,
+                topk=top_k,
                 cfg_scale=cfg_scale,
+                continuous_segments=None,
+                starts=None,
             )
 
             # Check for EOS
-            if mx.any(new_codes[:, 0] == self.config.audio_eos_id):
+            if mx.any(curr_token[0:1, :] >= self.config.audio_eos_id):
                 break
 
-            all_codes.append(new_codes[:, None, :])
+            frames.append(curr_token[0:1, :])
 
-        # Concatenate all frames (skip BOS)
-        codes = mx.concatenate(all_codes[1:], axis=1)
+            # Print progress every 10 frames
+            if (i + 1) % 10 == 0:
+                print(f"Generated {i + 1}/{max_audio_frames} frames...")
+
+        # Reset caches
+        self.heartmula.reset_caches()
+
+        # Stack frames: list of (1, num_codebooks) -> (num_frames, num_codebooks)
+        codes = mx.concatenate(frames, axis=0)  # (num_frames, num_codebooks)
+
+        # Transpose to (num_codebooks, num_frames) for HeartCodec
+        codes = codes.transpose(1, 0)  # (num_codebooks, num_frames)
 
         return codes
 
@@ -244,15 +315,25 @@ class HeartMuLaGenPipeline:
         """Convert codes to audio waveform.
 
         Args:
-            codes: Audio codes.
+            codes: Audio codes of shape (num_codebooks, num_frames).
             num_steps: ODE integration steps for HeartCodec.
             guidance_scale: CFG scale for HeartCodec.
 
         Returns:
             Audio waveform.
         """
+        # HeartCodec expects (batch, frames, num_quantizers)
+        codes = codes.transpose(1, 0)[None, :, :]  # (1, num_frames, num_codebooks)
+
+        # Calculate duration based on actual frames to avoid unnecessary padding
+        # HeartCodec's frame_rate is 50.0 (48kHz / 960 hop size)
+        num_frames = codes.shape[1]
+        codec_frame_rate = self.heartcodec.config.frame_rate or 50.0
+        duration = num_frames / codec_frame_rate
+
         audio = self.heartcodec.detokenize(
             codes=codes,
+            duration=duration,
             num_steps=num_steps,
             guidance_scale=guidance_scale,
         )
@@ -285,19 +366,19 @@ class HeartMuLaGenPipeline:
         Returns:
             Generated audio waveform.
         """
-        # Preprocess
-        text_ids = self.preprocess(lyrics=lyrics, tags=tags)
+        print("Preprocessing...")
+        inputs = self.preprocess(lyrics=lyrics, tags=tags, cfg_scale=cfg_scale)
 
-        # Generate codes
+        print(f"Generating {duration}s of audio...")
         codes = self.generate(
-            text_ids=text_ids,
+            inputs=inputs,
             duration=duration,
             temperature=temperature,
             top_k=top_k,
             cfg_scale=cfg_scale,
         )
 
-        # Postprocess to audio
+        print("Running HeartCodec detokenize...")
         audio = self.postprocess(
             codes=codes,
             num_steps=codec_steps,
@@ -311,6 +392,7 @@ class HeartMuLaGenPipeline:
         audio: mx.array,
         path: Union[str, Path],
         sample_rate: Optional[int] = None,
+        remove_dc: bool = True,
     ) -> None:
         """Save audio to file.
 
@@ -318,8 +400,8 @@ class HeartMuLaGenPipeline:
             audio: Audio waveform.
             path: Output file path.
             sample_rate: Sample rate (uses config default if None).
+            remove_dc: Whether to remove DC offset.
         """
-        import numpy as np
         import soundfile as sf
 
         sample_rate = sample_rate or self.config.sample_rate
@@ -333,8 +415,15 @@ class HeartMuLaGenPipeline:
         if audio_np.ndim == 2 and audio_np.shape[-1] == 1:
             audio_np = audio_np[:, 0]  # Remove channel dim
 
+        # Remove DC offset (the model can produce biased output)
+        if remove_dc:
+            audio_np = audio_np - audio_np.mean()
+
         # Normalize
-        audio_np = audio_np / max(np.abs(audio_np).max(), 1e-8)
+        max_val = np.abs(audio_np).max()
+        if max_val > 0:
+            audio_np = audio_np / max_val * 0.95  # Leave headroom
 
         # Save
         sf.write(str(path), audio_np, sample_rate)
+        print(f"Saved to {path}")
