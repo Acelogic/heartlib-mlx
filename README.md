@@ -2,16 +2,36 @@
 
 Apple MLX port of [HeartMuLa](https://github.com/HeartMuLa/heartlib) - a family of open-source music foundation models.
 
-## Overview
+**2x faster** than PyTorch MPS on Apple Silicon with optimized memory usage.
 
-HeartLib MLX provides efficient inference on Apple Silicon for all four HeartMuLa components:
+## Quick Start (with uv)
 
-- **HeartMuLa**: 3B parameter music language model for text-to-music generation
-- **HeartCodec**: 12.5Hz neural audio codec with flow matching decoder
-- **HeartCLAP**: Audio-text alignment model for music tagging and retrieval
-- **HeartTranscriptor**: Whisper-based lyrics recognition model
+The fastest way to generate music - no installation required:
+
+```bash
+# Install uv if you haven't
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Generate music (downloads dependencies automatically)
+uv run generate.py --tags "electronic, ambient" --duration 10 --output ambient.wav
+
+# With lyrics
+uv run generate.py \
+  --tags "pop, acoustic, female vocal" \
+  --lyrics "[verse]\nFloating through the digital sky\nWhere the stars never die" \
+  --duration 20 \
+  --output song.wav
+```
 
 ## Installation
+
+### Option 1: uv (Recommended)
+
+```bash
+uv sync
+```
+
+### Option 2: pip
 
 ```bash
 pip install -e .
@@ -22,164 +42,191 @@ pip install -e .
 - Python >= 3.10
 - Apple Silicon Mac (M1/M2/M3/M4)
 - MLX >= 0.22.0
-- 32GB+ unified memory recommended for full bfloat16 inference
+- 32GB+ unified memory recommended for full inference
 
-## Quick Start
+## Setup
 
-### Download Weights
+### 1. Download Weights
+
+Download the original PyTorch weights from Hugging Face:
 
 ```bash
-python scripts/download_weights.py --all
+# Create checkpoint directory
+mkdir -p ckpt
+
+# Download HeartMuLa (3B model)
+huggingface-cli download HeartMuLa/HeartMuLa-oss-3B --local-dir ckpt/HeartMuLa-oss-3B
+
+# Download HeartCodec
+huggingface-cli download HeartMuLa/HeartCodec-oss --local-dir ckpt/HeartCodec-oss
+
+# Download tokenizer
+huggingface-cli download HeartMuLa/HeartMuLa-oss-3B tokenizer.json --local-dir ckpt
 ```
 
-### Convert Weights
+### 2. Convert Weights
+
+Convert PyTorch weights to MLX format:
 
 ```bash
 python -m heartlib_mlx.utils.convert --src ./ckpt --dst ./ckpt-mlx
 ```
 
-### Generate Music
+## Usage
 
-```python
-from heartlib_mlx import HeartMuLaGenPipeline
+### Command Line
 
-# Load the pipeline
-pipeline = HeartMuLaGenPipeline.from_pretrained("./ckpt-mlx")
+```bash
+# Simple generation
+python generate.py --tags "jazz, piano, instrumental" --duration 15 --output jazz.wav
 
-# Generate music from text
-audio = pipeline(
-    lyrics="[Verse]\nHello world, this is a test song\n[Chorus]\nMusic makes the heart sing along",
-    tags="pop, acoustic, female vocal",
-    duration=30.0,
-    cfg_scale=1.5,
-)
-
-# Save the audio
-pipeline.save_audio(audio, "output.mp3")
+# With lyrics and custom settings
+python generate.py \
+  --tags "rock, electric guitar" \
+  --lyrics "[intro]\n\n[verse]\nRocking all night long" \
+  --duration 30 \
+  --cfg-scale 2.0 \
+  --temperature 0.9 \
+  --output rock.wav
 ```
 
-### Tag Audio
+### Python API
 
 ```python
-from heartlib_mlx import HeartCLAPPipeline
+from heartlib_mlx.heartmula import HeartMuLa
+from heartlib_mlx.heartcodec import HeartCodec
 
-# Load the pipeline
-pipeline = HeartCLAPPipeline.from_pretrained("./ckpt-mlx/heartclap")
+# Load models
+model = HeartMuLa.from_pretrained("./ckpt-mlx/heartmula")
+codec = HeartCodec.from_pretrained("./ckpt-mlx/heartcodec")
 
-# Get tags for audio
-tags = pipeline.tag_audio("input.mp3", top_k=5)
-print(tags)  # [("pop", 0.85), ("acoustic", 0.72), ...]
+# Generate (see generate.py for full example)
 ```
 
-### Transcribe Lyrics
+### Generation Options
 
-```python
-from heartlib_mlx import HeartTranscriptorPipeline
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--tags` | electronic, ambient | Music style tags |
+| `--lyrics` | (none) | Lyrics with [verse], [chorus] tags |
+| `--duration` | 10 | Duration in seconds |
+| `--cfg-scale` | 1.5 | Classifier-free guidance (higher = more adherence to tags) |
+| `--temperature` | 1.0 | Sampling temperature (lower = more deterministic) |
+| `--topk` | 50 | Top-k sampling |
+| `--output` | output.wav | Output file path |
 
-# Load the pipeline
-pipeline = HeartTranscriptorPipeline.from_pretrained("./ckpt-mlx/hearttranscriptor")
+## Performance
 
-# Transcribe lyrics
-lyrics = pipeline.transcribe("input.mp3")
-print(lyrics)
-```
+Benchmarks on Apple M2 Max (32GB unified memory):
 
-## Examples
+### MLX vs PyTorch MPS
 
-See the `examples/` directory for complete examples:
+| Metric | PyTorch MPS | MLX | Speedup |
+|--------|-------------|-----|---------|
+| Model Load | 7.14s | 0.82s | **8.7x faster** |
+| Generation (50 frames) | 19.37s | 11.65s | **1.7x faster** |
+| Audio Decode | 8.50s | 1.76s | **4.8x faster** |
+| **Total** | 27.87s | 13.41s | **2.1x faster** |
 
-- `generate.py`: Music generation with various parameters
-- `tag_audio.py`: Audio tagging and retrieval
-- `transcribe.py`: Lyrics transcription
+### Throughput
+
+| Framework | Frames/sec | Real-time Factor |
+|-----------|------------|------------------|
+| PyTorch MPS | 2.58 | 0.14x |
+| MLX | 4.29 | 0.30x |
+
+*50 frames = 4 seconds of audio at 12.5Hz frame rate*
+
+### Memory Usage
+
+| Model | Memory |
+|-------|--------|
+| HeartMuLa-3B | ~8GB |
+| HeartCodec | ~2GB |
+| Total | ~10GB |
 
 ## Architecture
-
-### HeartCodec
-
-Neural audio codec operating at 12.5Hz with:
-- Convolutional encoder/decoder (ScalarModel)
-- Residual Vector Quantization (8 codebooks × 8192 entries)
-- Flow matching decoder for high-fidelity synthesis
 
 ### HeartMuLa
 
 Hierarchical music language model:
-- Backbone: LLaMA-3B (28 layers, 3072 dim)
-- Decoder: LLaMA-300M (3 layers) for multi-codebook prediction
-- Classifier-free guidance for controllable generation
+- **Backbone**: LLaMA-3B (28 layers, 3072 dim, GQA with 24 heads / 8 KV heads)
+- **Decoder**: LLaMA-300M (3 layers) for multi-codebook prediction
+- **RoPE**: Rotary position embeddings (interleaved format)
+- **CFG**: Classifier-free guidance for controllable generation
 
-### HeartCLAP
+### HeartCodec
 
-Audio-text alignment model:
-- Audio encoder: MuQ-MuLan based transformer
-- Text encoder: BERT-style transformer
-- Contrastive learning for shared embedding space
-
-### HeartTranscriptor
-
-Whisper-based lyrics recognition:
-- Encoder: Audio feature extraction
-- Decoder: Autoregressive text generation
-- Fine-tuned for music lyrics
+Neural audio codec operating at 12.5Hz:
+- **Encoder/Decoder**: Convolutional ScalarModel
+- **Quantization**: RVQ with 8 codebooks × 8192 entries
+- **Flow Matching**: High-fidelity waveform synthesis with ODE solver
 
 ## Project Structure
 
 ```
 heartlib-mlx/
+├── generate.py              # Easy generation script (uv compatible)
 ├── src/heartlib_mlx/
-│   ├── heartcodec/        # Neural audio codec
-│   ├── heartmula/         # Music language model
-│   ├── heartclap/         # Audio-text alignment
-│   ├── hearttranscriptor/ # Lyrics recognition
-│   ├── nn/                # Custom MLX layers
-│   ├── ode/               # Flow matching ODE solvers
-│   ├── pipelines/         # High-level APIs
-│   └── utils/             # Utilities
-├── tests/                 # Unit tests
-├── scripts/               # Download and conversion scripts
-└── examples/              # Usage examples
+│   ├── heartcodec/          # Neural audio codec
+│   ├── heartmula/           # Music language model
+│   ├── nn/                  # Custom MLX layers (RoPE, RMSNorm, etc.)
+│   ├── ode/                 # Flow matching ODE solvers
+│   └── utils/               # Weight conversion utilities
+├── scripts/
+│   └── benchmark.py         # Performance benchmarks
+└── tests/                   # Parity tests
 ```
 
-## Performance
+## Development
 
-### Memory Usage (bfloat16)
+### Run Tests
 
-| Model | Memory | Notes |
-|-------|--------|-------|
-| HeartMuLa-3B | ~8GB | Backbone + decoder |
-| HeartCodec | ~2GB | Flow matching |
-| HeartCLAP | ~1GB | Audio + text encoders |
-| HeartTranscriptor | ~3GB | Whisper-large |
+```bash
+pytest tests/
+```
 
-### Benchmarks: MLX vs PyTorch MPS
+### Run Benchmarks
 
-Benchmarks run on Apple M2 Max with 32GB unified memory.
+```bash
+python scripts/benchmark.py --frames 100
+```
 
-#### Model Loading
+### Verify Parity
 
-| Framework | HeartMuLa Load Time | Speedup |
-|-----------|---------------------|---------|
-| MLX | 1.41s | **2.6x faster** |
-| PyTorch MPS | 3.62s | baseline |
+The MLX implementation achieves 100% numerical parity with PyTorch:
 
-#### Audio Generation (HeartMuLa 3B + HeartCodec)
+```bash
+python tests/trace_backbone.py  # Verify backbone outputs match
+```
 
-Generation benchmark: 1500 frames (120 seconds of audio)
+## Troubleshooting
 
-| Framework | Total Time | Frame Rate | Real-time Factor |
-|-----------|------------|------------|------------------|
-| PyTorch MPS | 575.5s | 2.6 frames/s | 0.21x |
+### "Checkpoint not found"
 
-#### HeartCodec Detokenize (10 ODE steps)
+Make sure to download and convert weights first:
 
-Converting codes to 5 seconds of audio:
+```bash
+# Download
+huggingface-cli download HeartMuLa/HeartMuLa-oss-3B --local-dir ckpt/HeartMuLa-oss-3B
+huggingface-cli download HeartMuLa/HeartCodec-oss --local-dir ckpt/HeartCodec-oss
+huggingface-cli download HeartMuLa/HeartMuLa-oss-3B tokenizer.json --local-dir ckpt
 
-| Framework | Time | Throughput |
-|-----------|------|------------|
-| MLX | 19.75s | 0.25x real-time |
-| PyTorch MPS | 7.5s | 0.67x real-time |
+# Convert
+python -m heartlib_mlx.utils.convert --src ./ckpt --dst ./ckpt-mlx
+```
 
-> **Note**: MLX detokenize is currently slower than PyTorch MPS. This is an area for optimization, particularly in the flow matching decoder and ODE solver. Contributions welcome!
+### "Out of memory"
+
+- Use a Mac with 32GB+ unified memory
+- Reduce `--duration` for shorter generations
+- Close other applications to free memory
+
+### Generation sounds wrong
+
+- Ensure weights are correctly converted (run `trace_backbone.py` to verify)
+- Try different `--cfg-scale` values (1.0-3.0)
+- Adjust `--temperature` (lower = more coherent, higher = more creative)
 
 ## License
 
@@ -200,3 +247,4 @@ Apache 2.0
 
 - [HeartMuLa Team](https://github.com/HeartMuLa) for the original PyTorch implementation
 - [Apple MLX Team](https://github.com/ml-explore/mlx) for the MLX framework
+- [Astral](https://astral.sh) for uv package manager

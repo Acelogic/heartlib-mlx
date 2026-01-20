@@ -34,6 +34,7 @@ class HeartCodec(nn.Module):
             num_bands=config.num_bands,
             sample_rate=config.sample_rate,
             causal=config.causal,
+            num_samples=config.num_samples,
             downsample_factors=config.downsample_factors,
             downsample_kernel_sizes=config.downsample_kernel_sizes,
             upsample_factors=config.upsample_factors,
@@ -149,6 +150,10 @@ class HeartCodec(nn.Module):
 
         # Average the two streams (simple merge strategy)
         audio = mx.mean(audio, axis=1)
+
+        # Truncate to target duration (matches PyTorch's min_samples truncation)
+        target_samples = int(duration * self.config.sample_rate)
+        audio = audio[:, :target_samples, :]
 
         return audio
 

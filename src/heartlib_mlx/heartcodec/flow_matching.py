@@ -31,6 +31,7 @@ class FFNBlock(nn.Module):
     ):
         super().__init__()
         hidden_features = hidden_features or out_features
+        self.kernel_size = kernel_size
 
         # Conv1d with kernel_size (no dilation)
         # PyTorch weight: (out, in, k)
@@ -55,7 +56,9 @@ class FFNBlock(nn.Module):
         """
         # Conv1d expects (batch, seq, channels)
         x = self.ffn_1(x)
-        x = nn.silu(x)
+        # Apply scaling factor (matches PyTorch's ProjectLayer: x * kernel_size**-0.5)
+        x = x * (self.kernel_size ** -0.5)
+        # NOTE: PyTorch's ProjectLayer has NO activation between conv and linear
         x = self.ffn_2(x)
         return x
 
@@ -74,13 +77,17 @@ class TimestepEmbedder(nn.Module):
         self.linear_1 = nn.Linear(frequency_embedding_size, hidden_size, bias=True)
         self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
 
-    def _timestep_embedding(self, t: mx.array) -> mx.array:
-        """Create sinusoidal timestep embeddings."""
+    def _timestep_embedding(self, t: mx.array, max_period: float = 10000.0, scale: float = 1000.0) -> mx.array:
+        """Create sinusoidal timestep embeddings.
+
+        Matches PyTorch's timestep_embedding with scale=1000 default.
+        """
         half_dim = self.frequency_embedding_size // 2
         freqs = mx.exp(
-            -mx.log(mx.array(10000.0)) * mx.arange(half_dim) / half_dim
+            -mx.log(mx.array(max_period)) * mx.arange(half_dim) / half_dim
         )
-        args = t[:, None] * freqs[None, :]
+        # Note: PyTorch multiplies by scale=1000, critical for correct embeddings!
+        args = t[:, None] * freqs[None, :] * scale
         embedding = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
         return embedding
 
@@ -116,23 +123,26 @@ class AdaLNSingle(nn.Module):
         self.emb.timestep_embedder = TimestepEmbedder(dim)
         self.linear = nn.Linear(dim, num_outputs * dim, bias=True)
 
-    def __call__(self, t: mx.array) -> mx.array:
+    def __call__(self, t: mx.array) -> tuple[mx.array, mx.array]:
         """Forward pass.
 
         Args:
             t: Timestep of shape (batch,).
 
         Returns:
-            Conditioning of shape (batch, num_outputs, dim).
+            Tuple of:
+            - conditioning: (batch, num_outputs, dim) for transformer blocks
+            - embedded_timestep: (batch, dim) for scale_shift_table modulation
         """
         t_emb = self.emb.timestep_embedder(t)
-        conditioning = self.linear(t_emb)
+        # Apply silu before linear (matches PyTorch: linear(silu(embedded_timestep)))
+        conditioning = self.linear(nn.silu(t_emb))
         # Reshape to (batch, num_outputs, dim)
         batch_size = conditioning.shape[0]
         dim = t_emb.shape[-1]
         num_outputs = conditioning.shape[-1] // dim
         conditioning = conditioning.reshape(batch_size, num_outputs, dim)
-        return conditioning
+        return conditioning, t_emb
 
 
 class FlowMatchingTransformerBlock(nn.Module):
@@ -278,6 +288,9 @@ class LlamaTransformerForFlowMatching(nn.Module):
             for _ in range(num_layers)
         ]
 
+        # Output norm for stage 1 (LayerNorm without affine, matches PyTorch)
+        self.norm_out = nn.LayerNorm(dim, eps=norm_eps, affine=False)
+
         # Scale/shift for final stage 1 output
         self.scale_shift_table = mx.zeros((2, dim))
 
@@ -302,6 +315,9 @@ class LlamaTransformerForFlowMatching(nn.Module):
             for _ in range(num_layers_2)
         ]
 
+        # Output norm for stage 2 (LayerNorm without affine, matches PyTorch)
+        self.norm_out_2 = nn.LayerNorm(dim_2, eps=norm_eps, affine=False)
+
         # Scale/shift for final stage 2 output
         self.scale_shift_table_2 = mx.zeros((2, dim_2))
 
@@ -311,49 +327,62 @@ class LlamaTransformerForFlowMatching(nn.Module):
     def __call__(
         self,
         t: mx.array,
-        x: mx.array,
-        condition: mx.array,
+        hidden_states: mx.array,
     ) -> mx.array:
         """Forward pass to predict velocity.
 
         Args:
             t: Timestep of shape (batch,) or (1,).
-            x: Noisy latent of shape (batch, seq_len, out_channels).
-            condition: Conditioning of shape (batch, seq_len, in_channels).
+            hidden_states: Concatenated input of shape (batch, seq_len, in_channels).
+                           This is [x, incontext_x, mu] concatenated along channels:
+                           - x: (batch, seq, 256) noisy latent
+                           - incontext_x: (batch, seq, 256) context latent
+                           - mu: (batch, seq, 512) VQ embeddings
+                           Total: 256 + 256 + 512 = 1024
 
         Returns:
             Predicted velocity of shape (batch, seq_len, out_channels).
         """
-        batch_size = x.shape[0]
+        batch_size = hidden_states.shape[0]
 
         # Expand t if needed
         if t.shape[0] == 1 and batch_size > 1:
             t = mx.broadcast_to(t, (batch_size,))
 
-        # Project condition to stage 1 dim
-        h = self.proj_in(condition)
+        # Project concatenated hidden_states to stage 1 dim
+        s = self.proj_in(hidden_states)
 
         # Stage 1 processing
-        adaln_cond = self.adaln_single(t)  # (batch, 6, dim)
+        adaln_cond, embedded_timestep = self.adaln_single(t)  # (batch, 6, dim), (batch, dim)
         for block in self.transformer_blocks:
-            h = block(h, adaln_cond)
+            s = block(s, adaln_cond)
 
-        # Apply final stage 1 scale/shift
-        shift, scale = self.scale_shift_table[0], self.scale_shift_table[1]
-        h = h * (1 + scale[None, None, :]) + shift[None, None, :]
+        # Apply final stage 1 norm and scale/shift (matches PyTorch)
+        # PyTorch: shift, scale = (scale_shift_table[None] + embedded_timestep[:, None]).chunk(2, dim=1)
+        s = self.norm_out(s)
+        # Combine scale_shift_table with embedded_timestep: (1, 2, dim) + (batch, 1, dim) -> (batch, 2, dim)
+        combined = self.scale_shift_table[None, :, :] + embedded_timestep[:, None, :]
+        shift = combined[:, 0:1, :]  # (batch, 1, dim)
+        scale = combined[:, 1:2, :]  # (batch, 1, dim)
+        s = s * (1 + scale) + shift
 
-        # Concatenate with original condition for connection
-        h = mx.concatenate([h, condition], axis=-1)
+        # Concatenate original hidden_states with stage 1 output for connection
+        # (matches PyTorch: x = torch.cat([hidden_states, s], dim=-1))
+        h = mx.concatenate([hidden_states, s], axis=-1)
         h = self.connection_proj(h)
 
         # Stage 2 processing
-        adaln_cond_2 = self.adaln_single_2(t)  # (batch, 6, dim_2)
+        adaln_cond_2, embedded_timestep_2 = self.adaln_single_2(t)  # (batch, 6, dim_2), (batch, dim_2)
         for block in self.transformer_blocks_2:
             h = block(h, adaln_cond_2)
 
-        # Apply final stage 2 scale/shift
-        shift2, scale2 = self.scale_shift_table_2[0], self.scale_shift_table_2[1]
-        h = h * (1 + scale2[None, None, :]) + shift2[None, None, :]
+        # Apply final stage 2 norm and scale/shift (matches PyTorch)
+        h = self.norm_out_2(h)
+        # Combine scale_shift_table_2 with embedded_timestep_2
+        combined_2 = self.scale_shift_table_2[None, :, :] + embedded_timestep_2[:, None, :]
+        shift2 = combined_2[:, 0:1, :]  # (batch, 1, dim_2)
+        scale2 = combined_2[:, 1:2, :]  # (batch, 1, dim_2)
+        h = h * (1 + scale2) + shift2
 
         # Output projection
         velocity = self.proj_out(h)
@@ -439,23 +468,79 @@ class FlowMatchingDecoder(nn.Module):
             mlp_hidden_dim_2=int(transformer_dim_2 * 8 / 3),  # ~8192
         )
 
-    def velocity(
+    def solve_euler(
         self,
-        t: mx.array,
         x: mx.array,
-        condition: mx.array,
+        incontext_x: mx.array,
+        incontext_length: int,
+        t_span: mx.array,
+        mu: mx.array,
+        guidance_scale: float,
     ) -> mx.array:
-        """Compute velocity for ODE integration.
+        """Euler ODE solver matching PyTorch's implementation.
 
         Args:
-            t: Timestep.
-            x: Current latent state.
-            condition: Conditioning signal.
+            x: Initial noise (batch, seq, latent_dim).
+            incontext_x: Context latent (batch, seq, latent_dim).
+            incontext_length: Number of context frames.
+            t_span: Time steps array.
+            mu: Conditioning from VQ embeddings (batch, seq, 512).
+            guidance_scale: CFG scale.
 
         Returns:
-            Velocity prediction.
+            Generated latent.
         """
-        return self.estimator(t, x, condition)
+        t = t_span[0]
+        dt = t_span[1] - t_span[0]
+        noise = x
+
+        for step in range(1, len(t_span)):
+            # Interpolate noise and context for incontext frames
+            if incontext_length > 0:
+                interp_factor = (1 - (1 - 1e-6) * t)
+                x = mx.concatenate([
+                    interp_factor * noise[:, :incontext_length, :] + t * incontext_x[:, :incontext_length, :],
+                    x[:, incontext_length:, :]
+                ], axis=1)
+
+            if guidance_scale > 1.0:
+                # Double batch for CFG
+                x_doubled = mx.concatenate([x, x], axis=0)
+                incontext_doubled = mx.concatenate([incontext_x, incontext_x], axis=0)
+                # Unconditional has zeros for mu
+                mu_uncond = mx.zeros_like(mu)
+                mu_doubled = mx.concatenate([mu_uncond, mu], axis=0)
+
+                # Concatenate [x, incontext_x, mu] along channel dim
+                hidden_states = mx.concatenate([x_doubled, incontext_doubled, mu_doubled], axis=-1)
+                t_tensor = mx.broadcast_to(mx.array([t]), (2,))
+
+                # Run estimator
+                dphi_dt = self.estimator(t_tensor, hidden_states)
+
+                # Split and apply CFG
+                dphi_dt_uncond, dphi_dt_cond = mx.split(dphi_dt, 2, axis=0)
+                dphi_dt = dphi_dt_uncond + guidance_scale * (dphi_dt_cond - dphi_dt_uncond)
+            else:
+                # Concatenate [x, incontext_x, mu] along channel dim
+                hidden_states = mx.concatenate([x, incontext_x, mu], axis=-1)
+                t_tensor = mx.array([t])
+                dphi_dt = self.estimator(t_tensor, hidden_states)
+
+            x = x + dt * dphi_dt
+            t = t + dt
+
+            if step < len(t_span) - 1:
+                dt = t_span[step + 1] - t_span[step]
+
+        # Restore context frames
+        if incontext_length > 0:
+            x = mx.concatenate([
+                incontext_x[:, :incontext_length, :],
+                x[:, incontext_length:, :]
+            ], axis=1)
+
+        return x
 
     def inference_codes(
         self,
@@ -463,7 +548,7 @@ class FlowMatchingDecoder(nn.Module):
         num_steps: int = 10,
         guidance_scale: float = 1.25,
     ) -> mx.array:
-        """Generate latents from codes.
+        """Generate latents from codes - matches PyTorch implementation.
 
         Args:
             codes: Audio codes of shape (batch, seq_len, num_quantizers).
@@ -479,56 +564,43 @@ class FlowMatchingDecoder(nn.Module):
         embeddings = self.vq_embed.from_codes(codes)
 
         # Project embeddings
-        embeddings = self.cond_feature_emb(embeddings)
+        mu = self.cond_feature_emb(embeddings)  # (batch, seq, 512)
 
-        # Upsample embeddings by 2x via interpolation
-        embeddings_up = mx.repeat(embeddings, 2, axis=1)
+        # Upsample by 2x using nearest neighbor interpolation
+        # PyTorch uses F.interpolate(x.permute(0,2,1), scale_factor=2, mode='nearest').permute(0,2,1)
+        mu = mx.repeat(mu, 2, axis=1)  # (batch, seq*2, 512)
 
-        # For conditioning, we need to project to in_channels
-        # In PyTorch this is done differently - let's check if we need more projection
-        # For now, pad to in_channels dimension
-        if embeddings_up.shape[-1] < self.in_channels:
-            padding = mx.zeros(
-                (batch_size, embeddings_up.shape[1], self.in_channels - embeddings_up.shape[-1])
-            )
-            condition = mx.concatenate([embeddings_up, padding], axis=-1)
-        else:
-            condition = embeddings_up[:, :, :self.in_channels]
+        num_frames = mu.shape[1]
+        latent_length = num_frames  # For simple case, all frames are generated
 
-        # Initialize random latent
-        out_len = seq_len * 2
-        x0 = mx.random.normal(shape=(batch_size, out_len, self.out_channels))
+        # Initialize random latent (matches PyTorch's latent_dim = 256)
+        latents = mx.random.normal(shape=(batch_size, num_frames, self.out_channels))
 
-        # Solve ODE from t=0 (noise) to t=1 (data)
-        if guidance_scale > 1.0:
-            # For CFG, create unconditional embedding
-            uncond = mx.broadcast_to(
-                self.zero_cond_embedding1[None, None, :],
-                (batch_size, condition.shape[1], self.dim)
-            )
-            if uncond.shape[-1] < self.in_channels:
-                padding = mx.zeros(
-                    (batch_size, uncond.shape[1], self.in_channels - uncond.shape[-1])
-                )
-                uncond = mx.concatenate([uncond, padding], axis=-1)
+        # Create masks (for simple generation, all frames are marked for generation)
+        # latent_masks = 2 means "generate this frame"
+        # For now, we use incontext_length = 0 (no context)
+        incontext_length = 0
+        incontext_latents = mx.zeros_like(latents)
 
-            x1 = euler_solve(
-                velocity_fn=self.velocity,
-                x0=x0,
-                condition=condition,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-                uncond=uncond,
-            )
-        else:
-            x1 = euler_solve(
-                velocity_fn=self.velocity,
-                x0=x0,
-                condition=condition,
-                num_steps=num_steps,
-            )
+        # Apply mask to mu: use mu where mask > 0.5, else use zero_cond_embedding
+        # For simple generation with full mask, mu stays as is
+        # (In PyTorch: quantized_feature_emb = (latent_masks > 0.5) * quantized_feature_emb +
+        #              (latent_masks < 0.5) * self.zero_cond_embedding1)
 
-        return x1
+        # Time span
+        t_span = mx.linspace(0, 1, num_steps + 1)
+
+        # Solve ODE
+        latents = self.solve_euler(
+            x=latents,
+            incontext_x=incontext_latents,
+            incontext_length=incontext_length,
+            t_span=t_span,
+            mu=mu,
+            guidance_scale=guidance_scale,
+        )
+
+        return latents
 
     def __call__(
         self,
