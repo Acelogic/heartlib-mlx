@@ -9,6 +9,7 @@
 #     "tokenizers>=0.15",
 #     "soundfile>=0.12",
 #     "tqdm>=4.60.0",
+#     "psutil>=5.9.0",
 # ]
 # ///
 """
@@ -23,7 +24,9 @@ Usage with pip:
 """
 
 import argparse
+import gc
 import sys
+import time
 from pathlib import Path
 
 # Add src to path for development
@@ -108,6 +111,17 @@ Examples:
         default="float32",
         choices=["float32", "bfloat16", "float16"],
         help="Model dtype (default: float32, use bfloat16 for less memory)",
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=float,
+        default=32.0,
+        help="Maximum memory in GB before aborting (default: 32)",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Ignore Audio EOS token and force full duration",
     )
     args = parser.parse_args()
 
@@ -239,6 +253,16 @@ Examples:
     mx.eval(curr_token)
     frames.append(curr_token[0:1])
 
+    # Set MLX memory limit if specified
+    max_memory_bytes = int(args.max_memory * 1024**3)
+    mx.set_memory_limit(max_memory_bytes)
+    mx.reset_peak_memory()
+    start_time = time.time()
+
+    import os
+    import psutil
+    process = psutil.Process(os.getpid())
+
     for i in tqdm(range(max_frames - 1), desc="Generating"):
         padded = mx.concatenate([
             curr_token[:, None, :],
@@ -259,12 +283,30 @@ Examples:
         )
         mx.eval(curr_token)
 
-        # Periodically clear MLX cache to prevent memory buildup
-        if i % 50 == 0 and i > 0:
+        # Clear MLX cache every 25 frames to prevent memory buildup
+        if (i + 1) % 25 == 0:
             mx.clear_cache()
+            gc.collect()
+
+        # Show stats every 50 frames
+        if (i + 1) % 50 == 0:
+            active_gb = mx.get_active_memory() / (1024**3)
+            peak_gb = mx.get_peak_memory() / (1024**3)
+            mem_info = process.memory_info()
+            vms_gb = mem_info.vms / (1024**3)  # Virtual Memory Size (Activity Monitor "Memory" column)
+            rss_gb = mem_info.rss / (1024**3)  # Resident Set Size (Activity Monitor "Real Mem" column)
+            elapsed = time.time() - start_time
+            fps = (i + 1) / elapsed
+            eta = (max_frames - i - 1) / fps if fps > 0 else 0
+            print(f"\n  [Frame {i+1}/{max_frames}] Metal: {active_gb:.1f}GB | VMS: {vms_gb:.1f}GB | RSS: {rss_gb:.1f}GB | {fps:.1f} f/s | ETA: {eta/60:.1f}min")
 
         if mx.any(curr_token[0] >= audio_eos_id):
-            break
+            if args.ignore_eos:
+                # Clamp tokens to valid range and continue
+                curr_token = mx.clip(curr_token, 0, audio_eos_id - 1)
+            else:
+                print(f"\n  Audio EOS reached at frame {i+1}")
+                break
         frames.append(curr_token[0:1])
 
     print(f"Generated {len(frames)} frames")
