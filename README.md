@@ -142,14 +142,44 @@ heartlib-mlx/
 
 ## Performance
 
-Memory usage and generation speed on Apple Silicon:
+### Memory Usage (bfloat16)
 
-| Model | Memory (bfloat16) | Notes |
-|-------|------------------|-------|
+| Model | Memory | Notes |
+|-------|--------|-------|
 | HeartMuLa-3B | ~8GB | Backbone + decoder |
 | HeartCodec | ~2GB | Flow matching |
 | HeartCLAP | ~1GB | Audio + text encoders |
 | HeartTranscriptor | ~3GB | Whisper-large |
+
+### Benchmarks: MLX vs PyTorch MPS
+
+Benchmarks run on Apple M2 Max with 32GB unified memory.
+
+#### Model Loading
+
+| Framework | HeartMuLa Load Time | Speedup |
+|-----------|---------------------|---------|
+| MLX | 1.41s | **2.6x faster** |
+| PyTorch MPS | 3.62s | baseline |
+
+#### Audio Generation (HeartMuLa 3B + HeartCodec)
+
+Generation benchmark: 1500 frames (120 seconds of audio)
+
+| Framework | Total Time | Frame Rate | Real-time Factor |
+|-----------|------------|------------|------------------|
+| PyTorch MPS | 575.5s | 2.6 frames/s | 0.21x |
+
+#### HeartCodec Detokenize (10 ODE steps)
+
+Converting codes to 5 seconds of audio:
+
+| Framework | Time | Throughput |
+|-----------|------|------------|
+| MLX | 19.75s | 0.25x real-time |
+| PyTorch MPS | 7.5s | 0.67x real-time |
+
+> **Note**: MLX detokenize is currently slower than PyTorch MPS. This is an area for optimization, particularly in the flow matching decoder and ODE solver. Contributions welcome!
 
 ## License
 
