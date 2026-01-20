@@ -33,9 +33,7 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor.
         """
-        # Compute RMS
-        rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return x / rms * self.weight
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class LlamaAttention(nn.Module):
@@ -127,42 +125,25 @@ class LlamaAttention(nn.Module):
             # Evaluate to materialize and prevent computation graph accumulation
             mx.eval(k, v)
 
-        # Repeat K, V for grouped-query attention
-        if self.n_rep > 1:
-            k = mx.repeat(k, self.n_rep, axis=2)
-            v = mx.repeat(v, self.n_rep, axis=2)
-
-        # Transpose to (batch, n_heads, seq_len, head_dim)
+        # Transpose to (batch, n_heads, seq_len, head_dim) for SDPA
+        # Note: SDPA handles GQA natively, no need to repeat K/V
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        # Compute attention
-        attn_weights = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-
-        if mask is not None:
-            attn_weights = attn_weights + mask
-
-        attn_weights = mx.softmax(attn_weights, axis=-1)
-
-        # Apply attention to values
-        output = attn_weights @ v
+        # Use fused scaled dot-product attention (Flash Attention)
+        # SDPA handles GQA automatically when n_kv_heads < n_heads
+        output = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=mask
+        )
 
         # Reshape back to (batch, seq_len, dim)
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         output = self.o_proj(output)
 
-        # Prepare cache for next iteration (undo the repeat for storage)
-        if self.n_rep > 1:
-            k_out = k[:, ::self.n_rep]
-            v_out = v[:, ::self.n_rep]
-        else:
-            k_out = k
-            v_out = v
-
-        # Transpose back to (batch, seq_len, n_heads, head_dim)
-        k_out = k_out.transpose(0, 2, 1, 3)
-        v_out = v_out.transpose(0, 2, 1, 3)
+        # Transpose K/V back to (batch, seq_len, n_kv_heads, head_dim) for cache
+        k_out = k.transpose(0, 2, 1, 3)
+        v_out = v.transpose(0, 2, 1, 3)
 
         return output, (k_out, v_out)
 
