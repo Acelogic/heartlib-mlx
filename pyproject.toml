@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heartlib-mlx"
+version = "0.1.0"
+description = "HeartMuLa music generation models ported to Apple MLX framework"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "HeartMuLa MLX Port", email = "heartmula.mlx@example.com"}
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+keywords = ["mlx", "music-generation", "audio", "apple-silicon", "machine-learning"]
+
+dependencies = [
+    "mlx>=0.22.0",
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20",
+    "tokenizers>=0.15",
+    "soundfile>=0.12",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+heartlib-convert = "heartlib_mlx.utils.convert:main"
+heartlib-download = "heartlib_mlx.utils.download:main"
+
+[project.urls]
+Homepage = "https://github.com/HeartMuLa/heartlib"
+Documentation = "https://heartmula.github.io/"
+Repository = "https://github.com/HeartMuLa/heartlib-mlx"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
